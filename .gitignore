@@ -1,5 +1,5 @@
-.jolib
-.model
+*.jolib
+*.model
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
