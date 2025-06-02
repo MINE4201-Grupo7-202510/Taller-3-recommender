@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+neo4j
+networkx
+gensim
+scikit-learn
+numpy
+python-multipart 

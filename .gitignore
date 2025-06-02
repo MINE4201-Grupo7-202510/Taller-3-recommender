@@ -1,4 +1,4 @@
-*.jolib
+*.joblib
 *.model
 
 # Byte-compiled / optimized / DLL files
