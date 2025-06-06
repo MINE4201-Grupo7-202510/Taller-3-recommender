@@ -1,8 +1,7 @@
-# main.py (FastAPI)
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase, Driver
+from neo4j.exceptions import Neo4jError
 import networkx as nx
 from gensim.models import Word2Vec
 from sklearn.metrics.pairwise import cosine_similarity
@@ -16,15 +15,15 @@ import asyncio # Para el Lock
 import math # Para math.isnan y math.isinf
 
 # --- Configuración ---
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password"
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 MODEL_DIR = "trained_models_cache"
 
 app = FastAPI(
     title="Sistema de Recomendación de Películas",
     description="Un API para obtener recomendaciones de películas con opción de reentrenamiento.",
-    version="0.1.5" # Nueva versión por corrección
+    version="0.2.0" # Nueva versión con explicaciones
 )
 
 # --- Configuración de CORS ---
@@ -330,14 +329,9 @@ async def shutdown_event():
 # --- Endpoint de Reentrenamiento ---
 @app.post("/admin/retrain-models", summary="Forzar el reentrenamiento de todos los modelos y datos")
 async def force_retrain_models():
-    global is_retraining # is_retraining se usa antes de asignar en este bloque, no necesita global aquí si solo se lee.
-
     if retrain_lock.locked():
         logger.info("Reentrenamiento solicitado, pero el lock ya está adquirido por otro proceso.")
         raise HTTPException(status_code=429, detail="Otro proceso de reentrenamiento ya está en curso. Inténtalo más tarde.")
-
-    # is_retraining flag is handled inside perform_full_training_and_save
-    # No necesitamos declarar global is_retraining aquí si solo la leemos y es manejada por la función llamada
 
     await retrain_lock.acquire()
     try:
@@ -351,7 +345,7 @@ async def force_retrain_models():
             logger.error(f"Fallo al obtener driver de Neo4j para reentrenamiento: {e}")
             raise HTTPException(status_code=500, detail=f"No se pudo conectar a Neo4j para reentrenamiento: {e}")
 
-        success = await perform_full_training_and_save() # Esta función maneja is_retraining
+        success = await perform_full_training_and_save()
         
         if success:
             return {"message": "Reentrenamiento completado y modelos actualizados exitosamente."}
@@ -367,12 +361,84 @@ async def force_retrain_models():
             retrain_lock.release()
 
 
-# --- Funciones de Recomendación y Sanitización ---
+# --- Funciones de Recomendación, Sanitización y Explicación ---
 def sanitize_value_for_json(value: Any) -> Any:
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value):
             return None 
     return value
+
+async def _get_movie_details_internal(movie_id: str, db_driver: Driver) -> Dict[str, Any]:
+    query = """
+    MATCH (m:Movie {movieId: $movie_id})
+    OPTIONAL MATCH (m)-[:HAS_GENRE]->(g:Genre)
+    OPTIONAL MATCH (m)-[:ACTED_BY]->(a:Actor)
+    OPTIONAL MATCH (m)-[:DIRECTED_BY]->(d:Director)
+    RETURN m.movieId AS movieId, m.title AS title, m.tconst AS tconst,
+           COLLECT(DISTINCT g.name) AS genres,
+           COLLECT(DISTINCT a.name) AS actors,
+           COLLECT(DISTINCT d.name) AS directors
+    LIMIT 1
+    """
+    default_data = {"movieId": movie_id, "title": "Película Desconocida", "tconst": None, "genres": [], "actors": [], "directors": []}
+    error_data = {"movieId": movie_id, "title": "Error al cargar detalles", "tconst": None, "genres": [], "actors": [], "directors": []}
+
+    try:
+        with db_driver.session(database="neo4j") as session:
+            result = session.run(query, movie_id=movie_id)
+            record = result.single()
+
+        if not record:
+            logger.warning(f"Internal details fetch: Movie with ID '{movie_id}' not found in DB.")
+            return default_data
+        
+        data = dict(record)
+        
+        for key in ["genres", "actors", "directors"]:
+            value = data.get(key)
+            if value is not None:
+                sanitized_list = [sanitize_value_for_json(item) for item in value]
+                data[key] = [item for item in sanitized_list if item is not None]
+            else:
+                data[key] = []
+        
+        if data.get("title") is None:
+            data["title"] = "Título no disponible"
+        
+        data["tconst"] = sanitize_value_for_json(data.get("tconst"))
+        data["movieId"] = sanitize_value_for_json(data.get("movieId", movie_id))
+
+
+        return data
+    except Neo4jError as e:
+        logger.error(f"Neo4j error fetching internal details for movie {movie_id}: {e}", exc_info=True)
+        return error_data
+    except Exception as e:
+        logger.error(f"Unexpected error fetching internal details for movie {movie_id}: {e}", exc_info=True)
+        return error_data
+
+def _create_shared_feature_explanation_fragment(current_movie_details: Dict[str, Any], anchor_movie_details: Dict[str, Any]) -> str:
+    current_genres = set(current_movie_details.get("genres", []))
+    anchor_genres = set(anchor_movie_details.get("genres", []))
+    common_genres = list(current_genres.intersection(anchor_genres))
+
+    if common_genres:
+        return f"ya que comparten el género '{common_genres[0]}'"
+
+    current_actors = set(current_movie_details.get("actors", []))
+    anchor_actors = set(anchor_movie_details.get("actors", []))
+    common_actors = list(current_actors.intersection(anchor_actors))
+    if common_actors:
+        return f"ya que el actor '{common_actors[0]}' participa en ambas"
+
+    current_directors = set(current_movie_details.get("directors", []))
+    anchor_directors = set(anchor_movie_details.get("directors", []))
+    common_directors = list(current_directors.intersection(anchor_directors))
+    if common_directors:
+        return f"ya que comparten al director '{common_directors[0]}'"
+    
+    return "por su conexión temática o de producción"
+
 
 def get_colaborative_recommendations(user_id_no_prefix: str, top_n: int = 10) -> List[Dict[str, Any]]:
     user_id_with_prefix = f"user_{user_id_no_prefix}"
@@ -419,28 +485,39 @@ def get_ontological_recommendations_for_movie(movie_id_no_prefix: str, top_n: in
 # --- Endpoints de la API ---
 @app.get("/")
 async def root():
-    return {"message": "Bienvenido al API de Recomendación de Películas! v0.1.5"}
+    return {"message": "Bienvenido al API de Recomendación de Películas! v0.2.0"}
 
 @app.get("/recommend/hybrid/{user_id}", summary="Recomendaciones híbridas para un usuario existente")
 async def hybrid_recommend_endpoint(user_id: str, alpha: float = 0.6, top_n: int = 10):
     logger.info(f"Solicitud de recomendación híbrida para user_id: {user_id}, alpha: {alpha}, top_n: {top_n}")
+    db_driver = get_neo4j_driver()
 
     if not node2vec_model or not collab_similarities_dict : 
         logger.warning("Componentes colaborativos no disponibles. No se pueden generar recomendaciones híbridas.")
         return {"user_id": user_id, "alpha": alpha, "recommendations": [], "message": "Modelo colaborativo no disponible."}
 
-    collab_recs = get_colaborative_recommendations(user_id, top_n=top_n * 2) 
+    collab_recs_initial = get_colaborative_recommendations(user_id, top_n=top_n * 2) # Get more for potential filtering
     
-    if not collab_recs:
+    if not collab_recs_initial:
         logger.info(f"No se encontraron recomendaciones colaborativas para user_id: {user_id}")
         return {"user_id": user_id, "alpha": alpha, "recommendations": [], "message": "No hay suficientes datos para recomendaciones colaborativas."}
 
-    best_collab_movie_id_np = collab_recs[0]["movieId"] if collab_recs else None
+    best_collab_movie_id_np = collab_recs_initial[0]["movieId"] if collab_recs_initial else None
 
     if not best_collab_movie_id_np: 
         logger.warning(f"No se pudo determinar una película ancla para {user_id}, devolviendo solo colaborativas.")
-        return {"user_id": user_id, "alpha": alpha, "recommendations": collab_recs[:top_n], "message": "Devolviendo solo colaborativas (no se encontró ancla ontológica)."}
+        # Populate explanations for collab_recs_initial before returning
+        explained_collab_recs = []
+        for rec in collab_recs_initial[:top_n]:
+            movie_details = await _get_movie_details_internal(rec["movieId"], db_driver)
+            movie_title = movie_details.get('title', 'esta película')
+            rec["explanation"] = f"Te recomendamos '{movie_title}' porque usuarios con gustos similares a los tuyos también la valoraron positivamente."
+            explained_collab_recs.append(rec)
+        return {"user_id": user_id, "alpha": alpha, "recommendations": explained_collab_recs, "message": "Devolviendo solo colaborativas (no se encontró ancla ontológica)."}
     
+    anchor_movie_details = await _get_movie_details_internal(best_collab_movie_id_np, db_driver)
+    anchor_title = anchor_movie_details.get('title', 'una película que te gustó')
+
     user_id_wp = f"user_{user_id}" 
     original_collab_scores_for_user_wp = collab_similarities_dict.get(user_id_wp, {})
     
@@ -450,31 +527,79 @@ async def hybrid_recommend_endpoint(user_id: str, alpha: float = 0.6, top_n: int
 
     combined_scores_np: Dict[str, float] = {}
 
-    for movie_id_wp_cs, collab_score_raw in original_collab_scores_for_user_wp.items():
-        movie_id_np_cs = movie_id_wp_cs.replace("movie_", "")
-        collab_score_norm = (collab_score_raw + 1) / 2 
-        combined_scores_np[movie_id_np_cs] = alpha * collab_score_norm
+    # Calculate combined scores
+    all_potential_movie_ids_np = set(m.replace("movie_", "") for m in original_collab_scores_for_user_wp.keys())
+    all_potential_movie_ids_np.update(ontological_scores_for_anchor_np.keys())
 
-    for movie_id_np_os, onto_score_raw in ontological_scores_for_anchor_np.items():
-        normalized_onto_score = onto_score_raw / max_onto_score 
+    for movie_id_np in all_potential_movie_ids_np:
+        # Collaborative part
+        collab_score_raw = original_collab_scores_for_user_wp.get(f"movie_{movie_id_np}", -2.0) # Use -2 to indicate not present if needed
+        collab_score_norm = (collab_score_raw + 1) / 2 if collab_score_raw > -1.5 else 0 # Normalize, or 0 if not in user's collab scores
         
-        current_weighted_score = combined_scores_np.get(movie_id_np_os, 0.0)
-        combined_scores_np[movie_id_np_os] = current_weighted_score + (1 - alpha) * normalized_onto_score
+        # Ontological part
+        onto_score_raw = ontological_scores_for_anchor_np.get(movie_id_np, 0)
+        normalized_onto_score = onto_score_raw / max_onto_score if max_onto_score > 0 else 0
+        
+        combined_scores_np[movie_id_np] = (alpha * collab_score_norm) + ((1 - alpha) * normalized_onto_score)
 
-    sorted_combined_recs = sorted(combined_scores_np.items(), key=lambda x: x[1], reverse=True)
+    sorted_combined_recs_tuples = sorted(combined_scores_np.items(), key=lambda x: x[1], reverse=True)
     
     final_recommendations = []
     seen_movie_ids = set()
 
-    for movie_id_np, score in sorted_combined_recs:
+    for movie_id_np, score_val in sorted_combined_recs_tuples:
         if len(final_recommendations) >= top_n: break
-        if movie_id_np not in seen_movie_ids: 
-            final_recommendations.append({"movieId": movie_id_np, "score": round(float(score), 4)})
-            seen_movie_ids.add(movie_id_np)
+        if movie_id_np in seen_movie_ids: continue
+        
+        current_movie_details = await _get_movie_details_internal(movie_id_np, db_driver)
+        movie_title = current_movie_details.get('title', 'esta película')
+
+        # Recalculate individual contributions for explanation
+        collab_score_raw = original_collab_scores_for_user_wp.get(f"movie_{movie_id_np}", -2.0)
+        collab_score_norm = (collab_score_raw + 1) / 2 if collab_score_raw > -1.5 else 0.0
+        
+        onto_score_raw = ontological_scores_for_anchor_np.get(movie_id_np, 0)
+        normalized_onto_score = onto_score_raw / max_onto_score if max_onto_score > 0 else 0.0
+        
+        collab_contrib_abs = alpha * collab_score_norm
+        onto_contrib_abs = (1 - alpha) * normalized_onto_score
+        
+        explanation = f"Te recomendamos '{movie_title}' basado en nuestro análisis." # Default
+
+        # Thresholds for "significant contribution"
+        collab_significant = collab_contrib_abs > 0.05 # Avoid tiny scores driving explanation
+        onto_significant = onto_contrib_abs > 0.05
+        
+        shared_feature_str = _create_shared_feature_explanation_fragment(current_movie_details, anchor_movie_details)
+
+        if collab_significant and onto_significant:
+            if abs(collab_contrib_abs - onto_contrib_abs) < 0.1 * max(collab_contrib_abs, onto_contrib_abs, 0.1): # Contributions are close
+                explanation = f"'{movie_title}' es una buena opción, combinando gustos de usuarios similares y su conexión con '{anchor_title}' ({shared_feature_str})."
+            elif collab_contrib_abs > onto_contrib_abs:
+                explanation = f"'{movie_title}' destaca entre usuarios con gustos parecidos. Además, tiene relación con '{anchor_title}' ({shared_feature_str})."
+            else: # onto_contrib_abs > collab_contrib_abs
+                explanation = f"Si te gustó '{anchor_title}', '{movie_title}' podría interesarte ({shared_feature_str}). También es apreciada por otros usuarios."
+        elif collab_significant:
+            explanation = f"Basado en tu historial y usuarios con gustos similares, '{movie_title}' parece una excelente opción."
+        elif onto_significant:
+            explanation = f"Dado tu posible interés en '{anchor_title}', te sugerimos '{movie_title}' ({shared_feature_str})."
+        
+        final_recommendations.append({
+            "movieId": movie_id_np, 
+            "score": round(float(score_val), 4),
+            "explanation": explanation
+        })
+        seen_movie_ids.add(movie_id_np)
             
-    if not final_recommendations and collab_recs: 
+    if not final_recommendations and collab_recs_initial: 
         logger.warning(f"Hibridación no generó resultados para {user_id}, usando solo colaborativas.")
-        return {"user_id": user_id, "alpha": alpha, "recommendations": collab_recs[:top_n], "message": "Fallback a recomendaciones colaborativas."}
+        explained_collab_recs = []
+        for rec in collab_recs_initial[:top_n]:
+            movie_details = await _get_movie_details_internal(rec["movieId"], db_driver)
+            movie_title = movie_details.get('title', 'esta película')
+            rec["explanation"] = f"Te recomendamos '{movie_title}' porque usuarios con gustos similares a los tuyos también la valoraron positivamente."
+            explained_collab_recs.append(rec)
+        return {"user_id": user_id, "alpha": alpha, "recommendations": explained_collab_recs, "message": "Fallback a recomendaciones colaborativas."}
 
     return {"user_id": user_id, "alpha": alpha, "recommendations": final_recommendations}
 
@@ -500,16 +625,27 @@ async def popular_by_genre_recommend_endpoint(genre_name: str, top_n: int = 10):
             results = session.run(query, genre_name=genre_name, top_n=top_n)
             for record in results:
                 movie_id = sanitize_value_for_json(record["movieId"])
-                title = sanitize_value_for_json(record["title"])
+                title_val = sanitize_value_for_json(record["title"])
+                rating_count_val = record["rating_count"]
                 
                 if movie_id is None: 
                     logger.warning(f"Película con movieId None encontrada para género {genre_name}, omitiendo.")
                     continue
 
+                movie_title_for_explanation = title_val if title_val else "esta película"
+                
+                explanation = f"'{movie_title_for_explanation}' es muy popular en el género '{genre_name}', con {rating_count_val} valoraciones de usuarios. ¡Podría gustarte!"
+                if rating_count_val == 0:
+                     explanation = f"'{movie_title_for_explanation}' pertenece al género '{genre_name}'. Aunque aún no tiene muchas valoraciones, podría ser una joya oculta."
+                elif rating_count_val < 10: # Example threshold
+                     explanation = f"'{movie_title_for_explanation}' es una opción interesante en el género '{genre_name}' con {rating_count_val} valoraciones."
+
+
                 recommendations.append({
                     "movieId": movie_id,
-                    "title": title if title is not None else "Título no disponible", 
-                    "rating_count": record["rating_count"] 
+                    "title": title_val if title_val is not None else "Título no disponible", 
+                    "rating_count": rating_count_val,
+                    "explanation": explanation
                 })
     except Exception as e:
         logger.error(f"Error obteniendo populares por género {genre_name}: {e}", exc_info=True)
@@ -524,59 +660,33 @@ async def popular_by_genre_recommend_endpoint(genre_name: str, top_n: int = 10):
 @app.get("/movies/{movie_id}", summary="Obtener detalles de una película")
 async def get_movie_details_endpoint(movie_id: str):
     db_driver = get_neo4j_driver()
-    query = """
-    MATCH (m:Movie {movieId: $movie_id})
-    OPTIONAL MATCH (m)-[:HAS_GENRE]->(g:Genre)
-    OPTIONAL MATCH (m)-[:ACTED_BY]->(a:Actor)
-    OPTIONAL MATCH (m)-[:DIRECTED_BY]->(d:Director)
-    RETURN m.movieId AS movieId, m.title AS title, m.tconst AS tconst,
-           COLLECT(DISTINCT g.name) AS genres,
-           COLLECT(DISTINCT a.name) AS actors,
-           COLLECT(DISTINCT d.name) AS directors
-    LIMIT 1
-    """
-    try:
-        with db_driver.session(database="neo4j") as session:
-            result = session.run(query, movie_id=movie_id).single()
-            if not result:
-                raise HTTPException(status_code=404, detail=f"Película con ID '{movie_id}' no encontrada.")
+    movie_details_result = await _get_movie_details_internal(movie_id, db_driver)
+    
+    # Check if essential movieId is missing or if title indicates an error state from internal function
+    if not movie_details_result.get("movieId") or \
+       movie_details_result.get("title") == "Película Desconocida" or \
+       movie_details_result.get("title") == "Error al cargar detalles":
+        
+        if movie_details_result.get("title") == "Película Desconocida":
+            raise HTTPException(status_code=404, detail=f"Película con ID '{movie_id}' no encontrada.")
+        else: # Covers "Error al cargar detalles" or missing movieId due to error
+            logger.error(f"Failed to fetch details for movie {movie_id} properly. Data: {movie_details_result}")
+            raise HTTPException(status_code=500, detail=f"Error interno al obtener detalles para la película '{movie_id}'.")
             
-            raw_movie_data = dict(result)
-            movie_data = {}
+    return movie_details_result
 
-            for key, value in raw_movie_data.items():
-                if key in ["genres", "actors", "directors"]: 
-                    if value is not None:
-                        sanitized_list = [sanitize_value_for_json(item) for item in value]
-                        movie_data[key] = [item for item in sanitized_list if item is not None]
-                    else:
-                        movie_data[key] = []
-                else: 
-                    movie_data[key] = sanitize_value_for_json(value)
-            
-            if movie_data.get("movieId") is None:
-                 logger.error(f"MovieId para {movie_id} se volvió None después de la sanitización. Esto es un problema de datos.")
-            if movie_data.get("title") is None:
-                movie_data["title"] = "Título no disponible"
-
-            return movie_data
-    except Exception as e:
-        logger.error(f"Error obteniendo detalles para película {movie_id}: {e}", exc_info=True)
-        if not isinstance(e, HTTPException):
-            raise HTTPException(status_code=500, detail="Error interno del servidor al buscar película.")
-        raise e
 
 @app.get("/users", summary="Listar todos los User IDs disponibles")
 async def list_users_endpoint():
-    global all_user_ids_from_graph # CORRECCIÓN: Poner global al inicio de la función
+    global all_user_ids_from_graph
     
     if not all_user_ids_from_graph:
-        if driver:
+        current_driver = get_neo4j_driver() # Ensure driver is available
+        if current_driver:
             logger.info("Lista de User IDs vacía, intentando recargar desde Neo4j...")
             try:
-                with driver.session(database="neo4j") as session:
+                with current_driver.session(database="neo4j") as session:
                     user_ids_result = session.run("MATCH (u:User) RETURN u.userId AS userId").data()
-                    # No es necesario volver a declarar global aquí si ya está al inicio del scope de la función
                     all_user_ids_from_graph = [record['userId'] for record in user_ids_result if record['userId'] is not None]
                     if all_user_ids_from_graph:
                         logger.info(f"Recargados {len(all_user_ids_from_graph)} User IDs desde Neo4j.")
@@ -585,6 +695,9 @@ async def list_users_endpoint():
                         logger.warning("No se encontraron User IDs en Neo4j al recargar.")
             except Exception as e:
                 logger.error(f"Error recargando User IDs desde Neo4j: {e}")
+        else:
+            logger.error("No se pudo obtener el driver de Neo4j para recargar User IDs.")
+
 
     if not all_user_ids_from_graph: 
          logger.warning("Lista de User IDs sigue vacía después del intento de recarga.")
